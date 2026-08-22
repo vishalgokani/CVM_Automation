@@ -1,44 +1,80 @@
 #!/usr/bin/env python3
 """
-CVM Douglas-Peucker automation
-==============================
+CVM AUTOMATION — DOUGLAS-PEUCKER ONLY
+=====================================
 
-Processes a directory containing batch folders such as:
+This is a standalone replacement for the original CVM batch driver. It
+processes the current flat final_dataset structure:
 
-    semiautomated/
-        batch001/
-            image1.bmp
-            image2.bmp
-            masks/
-                image1_C2.bmp
-                image1_C3.bmp
-                image1_C4.bmp
-            ...
+    final_dataset/
+        *.bmp                         original radiographs
+        masks/
+            *.bmp                     vertebral masks
+            c2/*.bmp, c3/*.bmp, c4/*.bmp   (also supported)
 
-For every original BMP, the script:
-  1. Finds the C2/C3/C4 binary masks.
-  2. Fits a 4-corner Douglas-Peucker quadrilateral to each mask.
-  3. Measures the anterior, posterior, superior and inferior quadrilateral
-     edges in pixels.
-  4. Measures inferior-endplate dome depth from the inferior chord.
-  5. Calculates CVM doming ratios:
-       C2 = C2 dome / C3 posterior height
-       C3 = C3 dome / C3 posterior height
-       C4 = C4 dome / C4 posterior height
-  6. Writes an overlay into:
-       <batch>/overlaid_Douglas-Peucker/
-  7. Writes ONE CSV containing all scans into:
-       <target directory>/cvm_measurements.csv
+It writes:
 
-Only Douglas-Peucker is used. No quadrilateral-fitter or min-area rectangle.
+    final_dataset/
+        overlaid_Douglas-Peucker/
+            *.bmp
 
-IMPORTANT:
-This is a standalone reconstruction of the geometry from the supplied CVM
-examples/specification. It does not depend on the previous Deploy/run_cvm.py.
+    <parent of final_dataset>/
+        cvm_measurements.csv
 
-RUNNING IN ANACONDA PROMPT
---------------------------
+IMPORTANT — DOME GEOMETRY
+-------------------------
+The original cvm_generate.py documentation describes the yellow measurement
+as:
 
+    inferior-border chord (between the two inferior Douglas-Peucker corners)
+    + the perpendicular up to the endplate dome apex
+
+and defines dome_height_px as the inferior-endplate concavity depth.
+
+Therefore the dome is NOT constrained to the midpoint of the inferior edge.
+
+This implementation searches the ENTIRE inferior Douglas-Peucker chord. For
+each point of the chord, it examines the actual annotated mask contour and
+finds the perpendicular displacement from the chord to the inferior
+endplate. The maximum perpendicular displacement is the dome height.
+
+The overlay draws:
+    grey dashed = original vertebral-body mask
+    green       = Douglas-Peucker quadrilateral
+    magenta     = posterior vertebral-body height
+    yellow      = entire inferior quadrilateral chord
+    cyan        = perpendicular at the DEEPEST dome location
+
+This follows the geometry documented in the original cvm_generate.py:
+the inferior chord plus the perpendicular to the dome apex. The supplied
+original documentation also states that C2/C3/C4 are measured with a
+posterior-height denominator and that >= 0.10 was used by the original
+driver; this script uses the user's requested strict rule: > 0.10.
+
+RATIO CONVENTION
+----------------
+    C2 = C2 dome / C3 posterior vertebral-body height
+    C3 = C3 dome / C3 posterior vertebral-body height
+    C4 = C4 dome / C4 posterior vertebral-body height
+
+DOMING
+------
+    ratio > 0.10 -> doming
+    ratio <= 0.10 -> no doming
+
+AUTOMATED CVM
+-------------
+    no doming C2/C3/C4 -> CVM1
+    doming C2 only      -> CVM2
+    doming C2 + C3     -> CVM3
+    doming C2 + C3 + C4 -> CVM4-6
+
+Any other complete pattern is reported as "atypical". Missing/failed
+measurements are also reported as "atypical" rather than being forced into
+a CVM class.
+
+ANACONDA PROMPT
+---------------
 Create the environment:
 
     conda create -n cvm_automation python=3.11
@@ -48,69 +84,27 @@ Install dependencies:
 
     pip install -r requirements.txt
 
-Run on the target directory:
+Run on the final dataset:
 
-    python cvm_automation.py --directory "\\wnresearch\Drobo\Vishal_Graham\ML Review\Spine\CVM_annotation\semiautomated"
+    python cvm_automation.py --directory "\\wnresearch\Drobo\Vishal_Graham\ML Review\Spine\CVM_annotation\semiautomated\final_dataset"
 
-Optional:
+Optional Douglas-Peucker starting epsilon:
 
-    python cvm_automation.py --directory "D:\\some\\folder"
+    python cvm_automation.py --directory "PATH_TO_FINAL_DATASET" --epsilon 0.02
 
-Optional tuning:
+The script automatically searches a range of epsilon values to obtain a
+four-corner Douglas-Peucker polygon. --epsilon controls which four-corner
+solution is preferred.
 
-    python cvm_automation.py --directory "D:\\some\\folder" --epsilon 0.02
-
-The default epsilon is adaptive. The script searches for an epsilon that
-produces exactly four Douglas-Peucker corners. --epsilon can be used to
-override the starting fraction of the contour perimeter.
-
-MASK NAMING
------------
-
-The script accepts several common layouts, including:
-
-    masks/image_C2.bmp
-    masks/image_C3.bmp
-    masks/image_C4.bmp
-
-or:
-
-    masks/C2/image.bmp
-    masks/C3/image.bmp
-    masks/C4/image.bmp
-
-It also recognizes c2/c3/c4 case-insensitively.
-
-If the C2/C3/C4 labels are absent but exactly three masks can be associated
-with an image, the script orders them vertically (upper=C2, middle=C3,
-lower=C4), which is appropriate for a lateral cervical spine.
-
-OUTPUT CSV
-----------
-
-One row per original radiograph. Columns include:
-  - batch
-  - filename
-  - C2/C3/C4 four edge lengths
-  - C2/C3/C4 dome heights
-  - C2/C3/C4 dome ratios
-  - additional width/height, aspect, diagonal and area measurements
-  - processing/QC status
-
-All distances are pixel distances.
-
-The overlay shows:
-  - Douglas-Peucker quadrilateral
-  - posterior/anterior/superior/inferior edge labels
-  - inferior chord
-  - dome-depth line and apex
-  - vertebral labels
+DEPENDENCIES
+------------
+numpy
+opencv-python
 """
 
 import argparse
 import csv
 import math
-import os
 import re
 from pathlib import Path
 
@@ -118,144 +112,136 @@ import cv2
 import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
+VERTEBRAE = ("C2", "C3", "C4")
 DEFAULT_EPSILON = 0.02
 MIN_MASK_AREA = 20
+DOMING_THRESHOLD = 0.10
 
-EDGE_NAMES = ("anterior", "posterior", "superior", "inferior")
 
-
-# ---------------------------------------------------------------------------
-# Basic geometry
-# ---------------------------------------------------------------------------
+# ============================================================================
+# BASIC GEOMETRY
+# ============================================================================
 
 def distance(a, b):
-    return float(np.linalg.norm(np.asarray(b, dtype=float) -
-                                np.asarray(a, dtype=float)))
-
-
-def cross2(a, b):
-    """2-D scalar cross product."""
-    return float(a[0] * b[1] - a[1] * b[0])
-
-
-def point_line_distance(point, a, b):
-    v = np.asarray(b, dtype=float) - np.asarray(a, dtype=float)
-    w = np.asarray(point, dtype=float) - np.asarray(a, dtype=float)
-    L = np.linalg.norm(v)
-    if L == 0:
-        return 0.0
-    return abs(cross2(v, w)) / L
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    return float(np.linalg.norm(b - a))
 
 
 def polygon_area(points):
     p = np.asarray(points, dtype=float)
-    return float(abs(np.cross(p, np.roll(p, -1, axis=0)).sum()) / 2.0)
+    return float(
+        abs(np.cross(p[:, 0], np.roll(p[:, 1], -1)).sum()) / 2.0
+    )
+
+
+def cross2(a, b):
+    return float(a[0] * b[1] - a[1] * b[0])
 
 
 def order_quad(points):
     """
-    Return four vertices in clockwise image order:
+    Order four image-space vertices as:
+
         top-left, top-right, bottom-right, bottom-left
 
-    This is deliberately based on the image coordinate system rather than
-    assuming the vertebral body is perfectly horizontal.
+    This ordering is subsequently used to define anatomical edges.
     """
     p = np.asarray(points, dtype=float)
+
+    if p.shape != (4, 2):
+        raise ValueError("Quadrilateral must contain exactly four vertices")
 
     s = p[:, 0] + p[:, 1]
     d = p[:, 0] - p[:, 1]
 
-    tl = p[np.argmin(s)]
-    br = p[np.argmax(s)]
-    tr = p[np.argmax(d)]
-    bl = p[np.argmin(d)]
+    q = np.array([
+        p[np.argmin(s)],
+        p[np.argmax(d)],
+        p[np.argmax(s)],
+        p[np.argmin(d)],
+    ], dtype=float)
 
-    q = np.array([tl, tr, br, bl], dtype=float)
-
-    # The sum/difference method can theoretically select duplicates for very
-    # unusual quadrilaterals. Fall back to angular ordering if necessary.
     if len({tuple(x) for x in q}) != 4:
-        c = p.mean(axis=0)
-        ang = np.arctan2(p[:, 1] - c[1], p[:, 0] - c[0])
-        q = p[np.argsort(ang)]
+        center = p.mean(axis=0)
+        angles = np.arctan2(
+            p[:, 1] - center[1],
+            p[:, 0] - center[0]
+        )
+        q = p[np.argsort(angles)]
 
-        # rotate to top-left-ish first
-        idx = np.argmin(q[:, 0] + q[:, 1])
-        q = np.roll(q, -idx, axis=0)
-
-    # Ensure clockwise order in image coordinates.
-    area_signed = np.cross(q, np.roll(q, -1, axis=0)).sum()
-    if area_signed < 0:
-        q = q[[0, 3, 2, 1]]
+        # Rotate so the first point is the upper-left-most point.
+        q = np.roll(
+            q,
+            -int(np.argmin(q[:, 0] + q[:, 1])),
+            axis=0
+        )
 
     return q
 
 
 def classify_edges(q):
     """
-    Determine anatomical edge names from the ordered quadrilateral.
+    Anatomical edge assignment used by the original CVM visualization:
 
-    In a lateral cervical radiograph:
-        posterior = left
-        anterior  = right
-        superior  = upper
-        inferior  = lower
+        superior = upper edge
+        anterior = right edge
+        inferior = lower edge
+        posterior = left edge
 
-    We choose the left/right pair by x-coordinate and the upper/lower pair
-    by y-coordinate. This remains stable for the oblique vertebral bodies
-    in the supplied examples.
+    Image coordinates have x increasing to the right and y increasing
+    downward.
     """
     q = np.asarray(q, dtype=float)
 
-    # Four geometric edges.
-    edges = [
-        (q[0], q[1]),  # top
-        (q[1], q[2]),  # right
-        (q[2], q[3]),  # bottom
-        (q[3], q[0]),  # left
-    ]
-
-    # top/bottom: compare mean y
-    top_idx = min(range(4), key=lambda i: np.mean(edges[i], axis=0)[1])
-    bottom_idx = max(range(4), key=lambda i: np.mean(edges[i], axis=0)[1])
-
-    # remaining two are anterior/posterior.
-    remaining = [i for i in range(4) if i not in (top_idx, bottom_idx)]
-
-    # The edge with larger mean x is anterior.
-    anterior_idx = max(
-        remaining,
-        key=lambda i: np.mean(edges[i], axis=0)[0]
-    )
-    posterior_idx = remaining[0] if remaining[1] == anterior_idx else remaining[1]
-
-    return {
-        "superior": edges[top_idx],
-        "inferior": edges[bottom_idx],
-        "anterior": edges[anterior_idx],
-        "posterior": edges[posterior_idx],
+    edges = {
+        "superior": (q[0], q[1]),
+        "anterior": (q[1], q[2]),
+        "inferior": (q[2], q[3]),
+        "posterior": (q[3], q[0]),
     }
 
+    # Correct obvious global flips in strongly tilted images.
+    superior_y = np.mean(edges["superior"], axis=0)[1]
+    inferior_y = np.mean(edges["inferior"], axis=0)[1]
 
-# ---------------------------------------------------------------------------
-# Mask / Douglas-Peucker processing
-# ---------------------------------------------------------------------------
+    if superior_y > inferior_y:
+        edges["superior"], edges["inferior"] = (
+            edges["inferior"],
+            edges["superior"],
+        )
+
+    posterior_x = np.mean(edges["posterior"], axis=0)[0]
+    anterior_x = np.mean(edges["anterior"], axis=0)[0]
+
+    if posterior_x > anterior_x:
+        edges["posterior"], edges["anterior"] = (
+            edges["anterior"],
+            edges["posterior"],
+        )
+
+    return edges
+
+
+# ============================================================================
+# MASKS
+# ============================================================================
 
 def read_binary_mask(path):
     img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+
     if img is None:
-        raise ValueError(f"Could not read mask: {path}")
+        raise ValueError(f"Cannot read mask: {path}")
 
     mask = (img > 0).astype(np.uint8)
 
-    # Fill small holes/noise without materially changing the annotated shape.
+    # Retain the largest connected foreground component.
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+
     if n > 1:
-        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        largest = 1 + np.argmax(
+            stats[1:, cv2.CC_STAT_AREA]
+        )
         mask = (labels == largest).astype(np.uint8)
 
     if int(mask.sum()) < MIN_MASK_AREA:
@@ -264,18 +250,139 @@ def read_binary_mask(path):
     return mask
 
 
+def normalized_name(path_or_name):
+    """
+    Normalize an image/mask stem for matching.
+
+    C2/C3/C4 and mask tokens are removed because masks may be named either:
+
+        scan_C2.bmp
+        scan_mask_C2.bmp
+        masks/C2/scan.bmp
+
+    while the original is:
+
+        scan.bmp
+    """
+    s = Path(path_or_name).stem.lower()
+    s = re.sub(r"[\s\-]+", "_", s)
+
+    s = re.sub(
+        r"(^|_)(mask|masks)(?=_|$)",
+        "_",
+        s
+    )
+
+    s = re.sub(
+        r"(^|_)(c2|c3|c4)(?=_|$)",
+        "_",
+        s
+    )
+
+    s = re.sub(r"_+", "_", s).strip("_")
+
+    return s
+
+
+def vertebra_from_path(path):
+    """
+    Determine C2/C3/C4 from either:
+        filename
+    or:
+        parent folder
+    """
+    stem = Path(path).stem.lower()
+
+    match = re.search(
+        r"(?:^|[_\-\s])(c[234])(?:[_\-\s.]|$)",
+        stem
+    )
+
+    if match:
+        return match.group(1).upper()
+
+    for part in reversed(Path(path).parts):
+        if part.lower() in ("c2", "c3", "c4"):
+            return part.upper()
+
+    return None
+
+
+def build_mask_index(mask_root):
+    """
+    Index all BMP masks once rather than recursively searching the mask
+    directory for every radiograph.
+    """
+    index = {}
+
+    for path in sorted(mask_root.rglob("*.bmp")):
+        if not path.is_file():
+            continue
+
+        v = vertebra_from_path(path)
+
+        if v not in VERTEBRAE:
+            continue
+
+        key = normalized_name(path)
+
+        index.setdefault((key, v), []).append(path)
+
+    return index
+
+
+def find_masks_for_image(image_path, mask_index):
+    """
+    Match the original radiograph with its C2/C3/C4 masks.
+
+    Exact normalized filename matching is preferred. If there are duplicate
+    candidates, a mask in an explicit C2/C3/C4 directory is preferred.
+    """
+    image_key = normalized_name(image_path)
+    result = {}
+
+    for v in VERTEBRAE:
+        candidates = mask_index.get((image_key, v), [])
+
+        if candidates:
+            # Prefer the candidate whose parent directory is literally C2/C3/C4.
+            explicit = [
+                p for p in candidates
+                if p.parent.name.lower() == v.lower()
+            ]
+
+            result[v] = explicit[0] if explicit else candidates[0]
+
+    # Conservative fallback for naming variants.
+    if len(result) < 3:
+        for (key, v), candidates in mask_index.items():
+            if v in result:
+                continue
+
+            if image_key in key or key in image_key:
+                explicit = [
+                    p for p in candidates
+                    if p.parent.name.lower() == v.lower()
+                ]
+                result[v] = explicit[0] if explicit else candidates[0]
+
+    return result
+
+
+# ============================================================================
+# DOUGLAS-PEUCKER QUADRILATERAL
+# ============================================================================
+
 def find_dp_quad(mask, epsilon_start=DEFAULT_EPSILON):
     """
-    Fit the convex hull with Douglas-Peucker and search for exactly four
+    Douglas-Peucker simplification of the mask convex hull to exactly four
     vertices.
 
-    The original CVM description specifies:
-      "Douglas-Peucker simplification of the convex hull to 4 vertices."
-
-    We therefore simplify the convex hull, not the raw noisy contour.
+    Only Douglas-Peucker is used. No quadrilateral-fitter and no
+    min-area-rectangle alternative is used.
     """
     contours, _ = cv2.findContours(
-        mask.astype(np.uint8),
+        mask,
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_NONE
     )
@@ -283,7 +390,10 @@ def find_dp_quad(mask, epsilon_start=DEFAULT_EPSILON):
     if not contours:
         raise ValueError("No contour found")
 
-    contour = max(contours, key=cv2.contourArea)
+    contour = max(
+        contours,
+        key=cv2.contourArea
+    )
 
     if cv2.contourArea(contour) < MIN_MASK_AREA:
         raise ValueError("Contour area too small")
@@ -294,430 +404,497 @@ def find_dp_quad(mask, epsilon_start=DEFAULT_EPSILON):
     if perimeter <= 0:
         raise ValueError("Invalid contour perimeter")
 
-    # First search a broad range. Starting around 2% of perimeter reproduces
-    # the usual DP scale for these masks while the search makes the procedure
-    # robust to differences in mask resolution.
-    epsilons = []
-
-    for frac in np.linspace(
-        max(0.0005, epsilon_start * 0.20),
-        max(0.01, epsilon_start * 5.0),
-        300
-    ):
-        epsilons.append(frac * perimeter)
-
-    # Also search a larger range if needed.
-    for frac in np.linspace(0.001, 0.20, 500):
-        epsilons.append(frac * perimeter)
-
     candidates = []
     seen = set()
 
-    for eps in epsilons:
-        approx = cv2.approxPolyDP(hull, eps, True)
-        n = len(approx)
+    # Search for exact four-vertex DP solutions.
+    fractions = np.unique(np.concatenate([
+        np.linspace(
+            max(0.0005, epsilon_start * 0.15),
+            max(0.01, epsilon_start * 6.0),
+            300
+        ),
+        np.linspace(0.001, 0.20, 500),
+    ]))
 
-        if n == 4:
-            q = approx[:, 0, :].astype(float)
-            key = tuple(np.round(q.flatten(), 3))
-            if key not in seen:
-                seen.add(key)
-                candidates.append(q)
+    for fraction in fractions:
+        approx = cv2.approxPolyDP(
+            hull,
+            float(fraction * perimeter),
+            True
+        )
+
+        if len(approx) != 4:
+            continue
+
+        q = approx[:, 0, :].astype(float)
+        key = tuple(np.round(q.flatten(), 3))
+
+        if key not in seen:
+            seen.add(key)
+            candidates.append(q)
 
     if not candidates:
-        # If a perfect 4-corner solution is impossible, select the
-        # approximation closest to four vertices and report that condition.
-        best = None
-        best_score = float("inf")
-
-        for frac in np.linspace(0.001, 0.20, 500):
-            approx = cv2.approxPolyDP(hull, frac * perimeter, True)
-            score = abs(len(approx) - 4) + 0.001 * frac
-            if score < best_score:
-                best_score = score
-                best = approx
-
-        if best is None or len(best) != 4:
-            raise ValueError(
-                f"Douglas-Peucker could not produce 4 corners "
-                f"(best had {len(best) if best is not None else 0})"
-            )
-
-        q = best[:, 0, :].astype(float)
-    else:
-        # Prefer the candidate closest to the requested epsilon. If several
-        # candidates have the same number of vertices, this gives deterministic
-        # behavior.
-        target = epsilon_start * perimeter
-        q = min(
-            candidates,
-            key=lambda x: abs(
-                cv2.arcLength(x.astype(np.float32).reshape(-1, 1, 2), True)
-                - target
-            )
+        raise ValueError(
+            "Douglas-Peucker could not produce exactly four corners"
         )
+
+    target_epsilon = epsilon_start * perimeter
+
+    q = min(
+        candidates,
+        key=lambda x: abs(
+            cv2.arcLength(
+                x.astype(np.float32).reshape(-1, 1, 2),
+                True
+            ) - target_epsilon
+        )
+    )
 
     return order_quad(q), contour
 
 
-# ---------------------------------------------------------------------------
-# Dome measurement
-# ---------------------------------------------------------------------------
+# ============================================================================
+# ORIGINAL-STYLE DOME MEASUREMENT
+# ============================================================================
 
 def measure_dome(mask, contour, inferior_edge, quad):
     """
-    Estimate inferior-endplate dome depth.
+    Measure the deepest inferior-endplate concavity over the ENTIRE inferior
+    Douglas-Peucker edge.
 
-    The inferior quadrilateral edge is treated as the chord. Foreground
-    contour points near that chord are examined, and the maximum perpendicular
-    displacement toward the vertebral-body interior is the dome depth.
+    This implements the geometry documented in the original cvm_generate.py:
 
-    Restricting the search to a band around the inferior chord prevents the
-    opposite/superior endplate from being incorrectly interpreted as the dome.
+        inferior-border chord + perpendicular to the dome apex
+
+    Algorithm:
+        1. Treat the inferior DP edge as the chord.
+        2. For every actual mask contour point, calculate its perpendicular
+           distance to that chord.
+        3. Keep points whose perpendicular projection falls on the chord.
+        4. Keep only points on the vertebral-body interior side.
+        5. Restrict the search to a band near the inferior edge so the
+           superior endplate cannot become the dome.
+        6. Select the contour point with MAXIMUM perpendicular distance.
+        7. The perpendicular foot on the inferior DP edge is the exact dome
+           base; the contour point is the exact dome apex.
+
+    This means the dome location is determined by the deepest point anywhere
+    along the inferior chord — NOT the midpoint.
     """
-    a, b = np.asarray(inferior_edge[0], float), np.asarray(inferior_edge[1], float)
+    a = np.asarray(inferior_edge[0], dtype=float)
+    b = np.asarray(inferior_edge[1], dtype=float)
+
     v = b - a
     L = np.linalg.norm(v)
 
-    if L == 0:
-        return 0.0, None
+    if L <= 0:
+        return 0.0, None, None
 
-    centroid = np.asarray(quad, float).mean(axis=0)
+    centroid = np.asarray(quad, dtype=float).mean(axis=0)
 
-    # Sign pointing toward the body interior.
+    # Determine which side of the chord contains the vertebral body.
     centroid_cross = cross2(v, centroid - a)
 
     if abs(centroid_cross) < 1e-8:
-        return 0.0, None
+        return 0.0, None, None
 
     points = contour[:, 0, :].astype(float)
 
+    # Signed perpendicular displacement from the chord.
     cross_values = np.array(
         [cross2(v, p - a) for p in points],
         dtype=float
     )
 
-    distances = np.abs(cross_values) / L
-    t = np.dot(points - a, v) / (L * L)
+    perpendicular_distance = (
+        np.abs(cross_values) / L
+    )
 
-    # Interior-side points.
+    # Position of each contour point's perpendicular projection along the
+    # inferior chord, expressed as t=0..1.
+    t = np.dot(
+        points - a,
+        v
+    ) / (L * L)
+
+    # Only contour points on the vertebral-body side of the chord.
     interior = (
         np.sign(cross_values) == np.sign(centroid_cross)
     )
 
-    # Only examine points whose projection lies on the inferior chord.
-    on_chord_projection = (t >= -0.05) & (t <= 1.05)
+    # Only contour points whose perpendicular foot lies on the chord.
+    on_chord = (
+        (t >= 0.0) &
+        (t <= 1.0)
+    )
 
-    # Restrict to a neighborhood of the inferior endplate. This is important:
-    # otherwise the superior contour can have a much larger distance to the
-    # inferior chord and would falsely become the "dome."
-    quad_height = max(
+    # Limit search to the inferior neighborhood. This prevents the superior
+    # endplate from being selected when the vertebral body is tilted.
+    body_height = max(
         distance(quad[0], quad[3]),
         distance(quad[1], quad[2]),
         1.0
     )
 
-    # 35% of vertebral height is intentionally generous for tilted bodies,
-    # but excludes the opposite endplate in the supplied examples.
-    near_inferior = distances <= 0.35 * quad_height
+    near_inferior = (
+        perpendicular_distance <= 0.35 * body_height
+    )
 
-    valid = interior & on_chord_projection & near_inferior
+    valid = (
+        interior &
+        on_chord &
+        near_inferior
+    )
 
     if not np.any(valid):
-        return 0.0, None
+        return 0.0, None, None
 
-    idxs = np.where(valid)[0]
-    best_local = idxs[np.argmax(distances[valid])]
+    valid_indices = np.where(valid)[0]
 
-    dome = float(distances[best_local])
-    apex = points[best_local]
-
-    return dome, apex
-
-
-# ---------------------------------------------------------------------------
-# Mask identification
-# ---------------------------------------------------------------------------
-
-def normalize_name(name):
-    s = Path(name).stem.lower()
-
-    # Remove common mask/vertebra tokens while preserving the original stem.
-    s = re.sub(r"[\s\-]+", "_", s)
-    s = re.sub(r"(^|_)(mask|masks)(?=_|$)", "_", s)
-    s = re.sub(r"(^|_)(c2|c3|c4)(?=_|$)", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-
-    return s
-
-
-def vertebra_from_path(path):
-    """
-    Identify C2/C3/C4 from filename or parent folder.
-    """
-    parts = [p.lower() for p in Path(path).parts]
-
-    for p in reversed(parts):
-        if re.search(r"(^|[_\-\s])c2([_\-\s.]|$)", p) or p == "c2":
-            return "C2"
-        if re.search(r"(^|[_\-\s])c3([_\-\s.]|$)", p) or p == "c3":
-            return "C3"
-        if re.search(r"(^|[_\-\s])c4([_\-\s.]|$)", p) or p == "c4":
-            return "C4"
-
-    stem = Path(path).stem.lower()
-
-    # Allow c2/c3/c4 anywhere as a token, including forms such as image_C2.
-    m = re.search(r"(?:^|[_\-\s])(c[234])(?:[_\-\s.]|$)", stem)
-    if m:
-        return m.group(1).upper()
-
-    return None
-
-
-def all_mask_files(batch_dir):
-    mask_root = batch_dir / "masks"
-
-    if not mask_root.is_dir():
-        return []
-
-    return [
-        p for p in mask_root.rglob("*")
-        if p.is_file() and p.suffix.lower() == ".bmp"
+    # THE key operation: choose the deepest perpendicular contour point over
+    # the complete inferior edge.
+    best_idx = valid_indices[
+        np.argmax(perpendicular_distance[valid])
     ]
 
-
-def group_masks_for_image(image_path, mask_files):
-    """
-    Return {C2: path, C3: path, C4: path}.
-
-    Matching is based primarily on normalized filename. Explicit C2/C3/C4
-    labels are preferred. If three unlabeled masks are associated with an
-    image, they are vertically ordered.
-    """
-    image_key = normalize_name(image_path.name)
-
-    explicit = {}
-    unlabeled = []
-
-    for p in mask_files:
-        key = normalize_name(p.name)
-
-        # Require the mask to resemble the image filename after removing
-        # mask/vertebra tokens.
-        if key != image_key:
-            continue
-
-        v = vertebra_from_path(p)
-
-        if v:
-            explicit[v] = p
-        else:
-            unlabeled.append(p)
-
-    # Also allow a looser filename containment match.
-    if len(explicit) + len(unlabeled) < 3:
-        for p in mask_files:
-            if p in explicit.values() or p in unlabeled:
-                continue
-
-            key = normalize_name(p.name)
-
-            if image_key in key or key in image_key:
-                v = vertebra_from_path(p)
-                if v:
-                    explicit[v] = p
-                else:
-                    unlabeled.append(p)
-
-    result = dict(explicit)
-
-    # If unlabeled masks remain, infer C2/C3/C4 by vertical position.
-    if unlabeled:
-        centers = []
-
-        for p in unlabeled:
-            try:
-                m = read_binary_mask(p)
-                ys, xs = np.where(m > 0)
-                if len(xs):
-                    centers.append((float(np.mean(ys)), p))
-            except Exception:
-                pass
-
-        centers.sort(key=lambda x: x[0])
-
-        for v, (_, p) in zip(
-            [x for x in ("C2", "C3", "C4") if x not in result],
-            centers
-        ):
-            result[v] = p
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Overlay
-# ---------------------------------------------------------------------------
-
-def draw_text(img, text, point, scale=0.65, thickness=2):
-    x, y = int(round(point[0])), int(round(point[1]))
-
-    # Black outline followed by white text for visibility on radiographs.
-    cv2.putText(
-        img, text, (x, y),
-        cv2.FONT_HERSHEY_SIMPLEX, scale,
-        (0, 0, 0), thickness + 3, cv2.LINE_AA
-    )
-    cv2.putText(
-        img, text, (x, y),
-        cv2.FONT_HERSHEY_SIMPLEX, scale,
-        (255, 255, 255), thickness, cv2.LINE_AA
+    dome_height = float(
+        perpendicular_distance[best_idx]
     )
 
+    apex = points[best_idx]
 
-def draw_quad_overlay(image, results):
-    """
-    Draw all successful vertebral measurements on the original image.
-    """
-    if len(image.shape) == 2:
-        overlay = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    else:
-        overlay = image.copy()
+    # Exact perpendicular foot on the inferior DP chord.
+    t_best = float(t[best_idx])
+    foot = a + t_best * v
 
-    # Colors in BGR.
-    quad_color = (0, 255, 0)
-    posterior_color = (255, 0, 255)
-    dome_color = (0, 255, 255)
-
-    for v in ("C2", "C3", "C4"):
-        r = results.get(v)
-
-        if not r or r.get("quad") is None:
-            continue
-
-        q = np.asarray(r["quad"], dtype=np.int32)
-
-        cv2.polylines(
-            overlay,
-            [q.reshape(-1, 1, 2)],
-            True,
-            quad_color,
-            2,
-            cv2.LINE_AA
-        )
-
-        # Label at centroid.
-        center = q.mean(axis=0)
-        draw_text(overlay, v, center, scale=0.65, thickness=2)
-
-        edges = r["edges"]
-
-        # Posterior.
-        p1, p2 = np.asarray(edges["posterior"], dtype=int)
-        cv2.line(
-            overlay, tuple(p1), tuple(p2),
-            posterior_color, 3, cv2.LINE_AA
-        )
-
-        # Inferior chord.
-        i1, i2 = np.asarray(edges["inferior"], dtype=int)
-        cv2.line(
-            overlay, tuple(i1), tuple(i2),
-            dome_color, 2, cv2.LINE_AA
-        )
-
-        # Dome perpendicular.
-        apex = r.get("dome_apex")
-
-        if apex is not None:
-            apex = np.asarray(apex, dtype=float)
-            a = np.asarray(edges["inferior"][0], dtype=float)
-            b = np.asarray(edges["inferior"][1], dtype=float)
-
-            v = b - a
-            denom = np.dot(v, v)
-
-            if denom > 0:
-                t = np.dot(apex - a, v) / denom
-                foot = a + t * v
-
-                cv2.line(
-                    overlay,
-                    tuple(np.round(foot).astype(int)),
-                    tuple(np.round(apex).astype(int)),
-                    dome_color,
-                    2,
-                    cv2.LINE_AA
-                )
-                cv2.circle(
-                    overlay,
-                    tuple(np.round(apex).astype(int)),
-                    4,
-                    dome_color,
-                    -1
-                )
-
-    return overlay
+    return dome_height, foot, apex
 
 
-# ---------------------------------------------------------------------------
-# Measurement row
-# ---------------------------------------------------------------------------
+# ============================================================================
+# MEASUREMENT
+# ============================================================================
 
-def measurement_for_mask(mask_path, vertebra, epsilon):
+def measure_mask(mask_path, vertebra, epsilon):
     mask = read_binary_mask(mask_path)
 
-    quad, contour = find_dp_quad(mask, epsilon)
+    quad, contour = find_dp_quad(
+        mask,
+        epsilon
+    )
+
     edges = classify_edges(quad)
 
-    dome, apex = measure_dome(
+    dome, dome_base, dome_apex = measure_dome(
         mask,
         contour,
         edges["inferior"],
         quad
     )
 
-    anterior = distance(*edges["anterior"])
-    posterior = distance(*edges["posterior"])
-    superior = distance(*edges["superior"])
-    inferior = distance(*edges["inferior"])
+    anterior = distance(
+        *edges["anterior"]
+    )
 
-    width = (anterior + posterior) / 2.0
-    height = (superior + inferior) / 2.0
+    posterior = distance(
+        *edges["posterior"]
+    )
 
-    diagonal1 = distance(quad[0], quad[2])
-    diagonal2 = distance(quad[1], quad[3])
+    superior = distance(
+        *edges["superior"]
+    )
+
+    inferior = distance(
+        *edges["inferior"]
+    )
+
+    mean_width = (
+        superior + inferior
+    ) / 2.0
+
+    mean_height = (
+        anterior + posterior
+    ) / 2.0
 
     return {
-        "mask_path": str(mask_path),
-        "vertebra": vertebra,
+        "mask": mask,
+        "contour": contour,
         "quad": quad,
         "edges": edges,
-        "dome_apex": apex,
+
+        "dome_px": dome,
+        "dome_base": dome_base,
+        "dome_apex": dome_apex,
+
         "anterior_px": anterior,
         "posterior_px": posterior,
         "superior_px": superior,
         "inferior_px": inferior,
-        "dome_px": dome,
-        "width_mean_px": width,
-        "height_mean_px": height,
-        "width_height_ratio": width / height if height else np.nan,
-        "dome_posterior_ratio": dome / posterior if posterior else np.nan,
-        "dome_height_ratio": dome / height if height else np.nan,
+
+        "width_mean_px": mean_width,
+        "height_mean_px": mean_height,
+
+        "width_height_ratio": (
+            mean_width / mean_height
+            if mean_height > 0 else np.nan
+        ),
+
+        "dome_height_ratio": (
+            dome / mean_height
+            if mean_height > 0 else np.nan
+        ),
+
         "area_px2": polygon_area(quad),
-        "diagonal_1_px": diagonal1,
-        "diagonal_2_px": diagonal2,
-        "mask_area_px2": float(mask.sum()),
+
+        "diagonal_1_px": distance(
+            quad[0], quad[2]
+        ),
+
+        "diagonal_2_px": distance(
+            quad[1], quad[3]
+        ),
+
+        "mask_area_px2": float(
+            mask.sum()
+        ),
     }
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
+# OVERLAY
+# ============================================================================
+
+def draw_dashed_polyline(
+    image,
+    points,
+    color=(150, 150, 150),
+    thickness=1,
+    dash=8,
+    gap=7
+):
+    """
+    Draw a faint dashed closed contour.
+    """
+    out = image.copy()
+    pts = np.asarray(points, dtype=float)
+
+    for i in range(len(pts)):
+        p0 = pts[i]
+        p1 = pts[(i + 1) % len(pts)]
+
+        vec = p1 - p0
+        length = np.linalg.norm(vec)
+
+        if length <= 0:
+            continue
+
+        unit = vec / length
+        position = 0.0
+
+        while position < length:
+            end = min(
+                position + dash,
+                length
+            )
+
+            a = p0 + unit * position
+            b = p0 + unit * end
+
+            cv2.line(
+                out,
+                tuple(np.round(a).astype(int)),
+                tuple(np.round(b).astype(int)),
+                color,
+                thickness,
+                cv2.LINE_AA
+            )
+
+            position += dash + gap
+
+    return out
+
+
+def draw_text(image, text, point, scale=0.5):
+    x, y = np.round(point).astype(int)
+
+    cv2.putText(
+        image,
+        text,
+        (int(x), int(y)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA
+    )
+
+    cv2.putText(
+        image,
+        text,
+        (int(x), int(y)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA
+    )
+
+
+def make_overlay(original, results):
+    if original.ndim == 2:
+        overlay = cv2.cvtColor(
+            original,
+            cv2.COLOR_GRAY2BGR
+        )
+    else:
+        overlay = original.copy()
+
+    # BGR.
+    MASK_GREY = (150, 150, 150)
+    QUAD_GREEN = (0, 255, 0)
+    POSTERIOR_MAGENTA = (255, 0, 255)
+    INFERIOR_YELLOW = (0, 255, 255)
+    DOME_CYAN = (255, 255, 0)
+
+    for v in VERTEBRAE:
+        r = results.get(v)
+
+        if r is None:
+            continue
+
+        # ---------------------------------------------------------------
+        # Faint dashed original mask outline.
+        # ---------------------------------------------------------------
+        contours, _ = cv2.findContours(
+            r["mask"].astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE
+        )
+
+        for contour in contours:
+            if cv2.contourArea(contour) >= MIN_MASK_AREA:
+                overlay = draw_dashed_polyline(
+                    overlay,
+                    contour[:, 0, :],
+                    MASK_GREY,
+                    thickness=1,
+                    dash=7,
+                    gap=7
+                )
+
+        # ---------------------------------------------------------------
+        # Douglas-Peucker quadrilateral.
+        # ---------------------------------------------------------------
+        q = np.round(
+            r["quad"]
+        ).astype(int)
+
+        cv2.polylines(
+            overlay,
+            [q.reshape(-1, 1, 2)],
+            True,
+            QUAD_GREEN,
+            2,
+            cv2.LINE_AA
+        )
+
+        # ---------------------------------------------------------------
+        # Posterior height.
+        # ---------------------------------------------------------------
+        p0, p1 = [
+            np.round(x).astype(int)
+            for x in r["edges"]["posterior"]
+        ]
+
+        cv2.line(
+            overlay,
+            tuple(p0),
+            tuple(p1),
+            POSTERIOR_MAGENTA,
+            2,
+            cv2.LINE_AA
+        )
+
+        # ---------------------------------------------------------------
+        # Inferior DP chord.
+        # ---------------------------------------------------------------
+        i0, i1 = [
+            np.round(x).astype(int)
+            for x in r["edges"]["inferior"]
+        ]
+
+        cv2.line(
+            overlay,
+            tuple(i0),
+            tuple(i1),
+            INFERIOR_YELLOW,
+            2,
+            cv2.LINE_AA
+        )
+
+        # ---------------------------------------------------------------
+        # Deepest dome.
+        #
+        # The cyan line is drawn from the exact perpendicular foot on the
+        # inferior DP edge to the exact contour apex selected by measure_dome.
+        # ---------------------------------------------------------------
+        if (
+            r["dome_base"] is not None and
+            r["dome_apex"] is not None
+        ):
+            base = np.asarray(
+                r["dome_base"],
+                dtype=float
+            )
+
+            apex = np.asarray(
+                r["dome_apex"],
+                dtype=float
+            )
+
+            cv2.line(
+                overlay,
+                tuple(np.round(base).astype(int)),
+                tuple(np.round(apex).astype(int)),
+                DOME_CYAN,
+                2,
+                cv2.LINE_AA
+            )
+
+            cv2.circle(
+                overlay,
+                tuple(np.round(base).astype(int)),
+                3,
+                INFERIOR_YELLOW,
+                -1
+            )
+
+            cv2.circle(
+                overlay,
+                tuple(np.round(apex).astype(int)),
+                4,
+                DOME_CYAN,
+                -1
+            )
+
+        # Vertebral label.
+        center = r["quad"].mean(axis=0)
+
+        draw_text(
+            overlay,
+            v,
+            center,
+            scale=0.60
+        )
+
+    return overlay
+
+
+# ============================================================================
 # CSV
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 CSV_COLUMNS = [
-    "batch",
     "filename",
     "status",
     "message",
@@ -735,6 +912,7 @@ CSV_COLUMNS = [
     "C2_diagonal_1_px",
     "C2_diagonal_2_px",
     "C2_mask_area_px2",
+    "C2_is_doming",
 
     "C3_anterior_px",
     "C3_posterior_px",
@@ -749,6 +927,7 @@ CSV_COLUMNS = [
     "C3_diagonal_1_px",
     "C3_diagonal_2_px",
     "C3_mask_area_px2",
+    "C3_is_doming",
 
     "C4_anterior_px",
     "C4_posterior_px",
@@ -763,271 +942,476 @@ CSV_COLUMNS = [
     "C4_diagonal_1_px",
     "C4_diagonal_2_px",
     "C4_mask_area_px2",
+    "C4_is_doming",
 
-    # Official CVM doming ratios.
     "C2_doming_ratio_C2_dome_over_C3_posterior",
     "C3_doming_ratio_C3_dome_over_C3_posterior",
     "C4_doming_ratio_C4_dome_over_C4_posterior",
+
+    "doming_pattern",
+    "predicted_CVM",
 ]
 
 
-def fmt(x):
-    if x is None:
+def fmt(value):
+    if value is None:
         return ""
+
     try:
-        if np.isnan(x):
+        if np.isnan(value):
             return ""
-    except Exception:
+    except (TypeError, ValueError):
         pass
-    if isinstance(x, (float, np.floating)):
-        return f"{float(x):.6f}"
-    return str(x)
+
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):.6f}"
+
+    return str(value)
 
 
-def make_csv_row(batch, filename, results, status="ok", message=""):
+def make_row(filename, results, status, message):
     row = {
-        "batch": batch,
         "filename": filename,
         "status": status,
         "message": message,
     }
 
-    for v in ("C2", "C3", "C4"):
+    for v in VERTEBRAE:
         r = results.get(v)
 
-        if r:
-            row[f"{v}_anterior_px"] = fmt(r["anterior_px"])
-            row[f"{v}_posterior_px"] = fmt(r["posterior_px"])
-            row[f"{v}_superior_px"] = fmt(r["superior_px"])
-            row[f"{v}_inferior_px"] = fmt(r["inferior_px"])
-            row[f"{v}_dome_px"] = fmt(r["dome_px"])
-            row[f"{v}_width_mean_px"] = fmt(r["width_mean_px"])
-            row[f"{v}_height_mean_px"] = fmt(r["height_mean_px"])
-            row[f"{v}_width_height_ratio"] = fmt(r["width_height_ratio"])
-            row[f"{v}_dome_height_ratio"] = fmt(r["dome_height_ratio"])
-            row[f"{v}_area_px2"] = fmt(r["area_px2"])
-            row[f"{v}_diagonal_1_px"] = fmt(r["diagonal_1_px"])
-            row[f"{v}_diagonal_2_px"] = fmt(r["diagonal_2_px"])
-            row[f"{v}_mask_area_px2"] = fmt(r["mask_area_px2"])
-        else:
+        if r is None:
             for col in CSV_COLUMNS:
                 if col.startswith(v + "_"):
                     row[col] = ""
+            continue
+
+        row[f"{v}_anterior_px"] = fmt(
+            r["anterior_px"]
+        )
+
+        row[f"{v}_posterior_px"] = fmt(
+            r["posterior_px"]
+        )
+
+        row[f"{v}_superior_px"] = fmt(
+            r["superior_px"]
+        )
+
+        row[f"{v}_inferior_px"] = fmt(
+            r["inferior_px"]
+        )
+
+        row[f"{v}_dome_px"] = fmt(
+            r["dome_px"]
+        )
+
+        row[f"{v}_width_mean_px"] = fmt(
+            r["width_mean_px"]
+        )
+
+        row[f"{v}_height_mean_px"] = fmt(
+            r["height_mean_px"]
+        )
+
+        row[f"{v}_width_height_ratio"] = fmt(
+            r["width_height_ratio"]
+        )
+
+        row[f"{v}_dome_height_ratio"] = fmt(
+            r["dome_height_ratio"]
+        )
+
+        row[f"{v}_area_px2"] = fmt(
+            r["area_px2"]
+        )
+
+        row[f"{v}_diagonal_1_px"] = fmt(
+            r["diagonal_1_px"]
+        )
+
+        row[f"{v}_diagonal_2_px"] = fmt(
+            r["diagonal_2_px"]
+        )
+
+        row[f"{v}_mask_area_px2"] = fmt(
+            r["mask_area_px2"]
+        )
 
     c2 = results.get("C2")
     c3 = results.get("C3")
     c4 = results.get("C4")
 
-    # The official CVM convention:
-    # C2 dome / C3 posterior
-    # C3 dome / C3 posterior
-    # C4 dome / C4 posterior
-    if c2 and c3 and c3["posterior_px"] > 0:
-        row["C2_doming_ratio_C2_dome_over_C3_posterior"] = fmt(
-            c2["dome_px"] / c3["posterior_px"]
-        )
-    else:
-        row["C2_doming_ratio_C2_dome_over_C3_posterior"] = ""
+    # ---------------------------------------------------------------
+    # Official ratios.
+    # ---------------------------------------------------------------
+    c2_ratio = None
+    c3_ratio = None
+    c4_ratio = None
 
-    if c3 and c3["posterior_px"] > 0:
-        row["C3_doming_ratio_C3_dome_over_C3_posterior"] = fmt(
-            c3["dome_px"] / c3["posterior_px"]
+    if (
+        c2 is not None and
+        c3 is not None and
+        c3["posterior_px"] > 0
+    ):
+        c2_ratio = (
+            c2["dome_px"] /
+            c3["posterior_px"]
         )
-    else:
-        row["C3_doming_ratio_C3_dome_over_C3_posterior"] = ""
 
-    if c4 and c4["posterior_px"] > 0:
-        row["C4_doming_ratio_C4_dome_over_C4_posterior"] = fmt(
-            c4["dome_px"] / c4["posterior_px"]
+    if (
+        c3 is not None and
+        c3["posterior_px"] > 0
+    ):
+        c3_ratio = (
+            c3["dome_px"] /
+            c3["posterior_px"]
+        )
+
+    if (
+        c4 is not None and
+        c4["posterior_px"] > 0
+    ):
+        c4_ratio = (
+            c4["dome_px"] /
+            c4["posterior_px"]
+        )
+
+    row[
+        "C2_doming_ratio_C2_dome_over_C3_posterior"
+    ] = fmt(c2_ratio)
+
+    row[
+        "C3_doming_ratio_C3_dome_over_C3_posterior"
+    ] = fmt(c3_ratio)
+
+    row[
+        "C4_doming_ratio_C4_dome_over_C4_posterior"
+    ] = fmt(c4_ratio)
+
+    # ---------------------------------------------------------------
+    # Doming threshold: STRICTLY > 0.10.
+    # ---------------------------------------------------------------
+    states = {}
+
+    states["C2"] = (
+        None
+        if c2_ratio is None
+        else c2_ratio > DOMING_THRESHOLD
+    )
+
+    states["C3"] = (
+        None
+        if c3_ratio is None
+        else c3_ratio > DOMING_THRESHOLD
+    )
+
+    states["C4"] = (
+        None
+        if c4_ratio is None
+        else c4_ratio > DOMING_THRESHOLD
+    )
+
+    for v in VERTEBRAE:
+        state = states[v]
+
+        if state is None:
+            row[f"{v}_is_doming"] = ""
+        else:
+            row[f"{v}_is_doming"] = (
+                "yes" if state else "no"
+            )
+
+    # ---------------------------------------------------------------
+    # Predicted CVM.
+    #
+    # Valid developmental sequence:
+    #   000 = CVM1
+    #   100 = CVM2
+    #   110 = CVM3
+    #   111 = CVM4-6
+    #
+    # Everything else = atypical.
+    # ---------------------------------------------------------------
+    if all(
+        states[v] is not None
+        for v in VERTEBRAE
+    ):
+        pattern = (
+            int(states["C2"]),
+            int(states["C3"]),
+            int(states["C4"]),
+        )
+
+        pattern_string = "".join(
+            str(x) for x in pattern
+        )
+
+        mapping = {
+            (0, 0, 0): "CVM1",
+            (1, 0, 0): "CVM2",
+            (1, 1, 0): "CVM3",
+            (1, 1, 1): "CVM4-6",
+        }
+
+        predicted = mapping.get(
+            pattern,
+            "atypical"
         )
     else:
-        row["C4_doming_ratio_C4_dome_over_C4_posterior"] = ""
+        pattern_string = ""
+        predicted = "atypical"
+
+    row["doming_pattern"] = pattern_string
+    row["predicted_CVM"] = predicted
 
     return row
 
 
-# ---------------------------------------------------------------------------
-# Batch processing
-# ---------------------------------------------------------------------------
+# ============================================================================
+# IMAGE PROCESSING
+# ============================================================================
 
-def process_image(image_path, batch_dir, epsilon):
-    batch = batch_dir.name
-    filename = image_path.name
+def process_image(
+    image_path,
+    mask_index,
+    output_dir,
+    epsilon
+):
+    original = cv2.imread(
+        str(image_path),
+        cv2.IMREAD_UNCHANGED
+    )
 
-    image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-
-    if image is None:
-        return make_csv_row(
-            batch, filename, {},
-            status="error",
-            message="Could not read original BMP"
+    if original is None:
+        return make_row(
+            image_path.name,
+            {},
+            "error",
+            "Could not read original BMP"
         )
 
-    mask_files = all_mask_files(batch_dir)
-    mask_map = group_masks_for_image(image_path, mask_files)
+    mask_map = find_masks_for_image(
+        image_path,
+        mask_index
+    )
 
     results = {}
     errors = []
 
-    for v in ("C2", "C3", "C4"):
+    for v in VERTEBRAE:
         mask_path = mask_map.get(v)
 
         if mask_path is None:
-            errors.append(f"{v} mask not found")
+            errors.append(
+                f"{v} mask not found"
+            )
             continue
 
         try:
-            results[v] = measurement_for_mask(
+            results[v] = measure_mask(
                 mask_path,
                 v,
                 epsilon
             )
-        except Exception as e:
-            errors.append(f"{v}: {e}")
+        except Exception as exc:
+            errors.append(
+                f"{v}: {exc}"
+            )
 
-    # Create overlay even when some vertebrae are missing.
-    overlay = draw_quad_overlay(image, results)
+    overlay = make_overlay(
+        original,
+        results
+    )
 
-    output_dir = batch_dir / "overlaid_Douglas-Peucker"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    output_path = output_dir / image_path.name
+    output_path = (
+        output_dir /
+        image_path.name
+    )
 
-    if not cv2.imwrite(str(output_path), overlay):
-        errors.append("Could not write overlay")
+    if not cv2.imwrite(
+        str(output_path),
+        overlay
+    ):
+        errors.append(
+            "Could not write overlay"
+        )
 
     if errors:
-        status = "partial" if results else "error"
+        status = (
+            "partial"
+            if results
+            else "error"
+        )
         message = "; ".join(errors)
     else:
         status = "ok"
         message = ""
 
-    return make_csv_row(
-        batch,
-        filename,
+    return make_row(
+        image_path.name,
         results,
-        status=status,
-        message=message
+        status,
+        message
     )
 
 
-def find_batches(root):
-    """
-    Find directories named batch001, batch002, ... at any depth immediately
-    below the supplied target, while avoiding generated output directories.
-    """
-    batches = []
-
-    for p in root.rglob("*"):
-        if not p.is_dir():
-            continue
-
-        if re.fullmatch(r"batch\d+", p.name, re.IGNORECASE):
-            batches.append(p)
-
-    return sorted(
-        set(batches),
-        key=lambda p: (
-            int(re.search(r"\d+", p.name).group()),
-            str(p).lower()
-        )
-    )
-
-
-def find_original_images(batch):
-    """
-    Original BMPs are BMP files directly inside the batch folder.
-
-    Anything under masks/ or the generated overlay directory is excluded.
-    """
-    return sorted(
-        [
-            p for p in batch.glob("*.bmp")
-            if p.is_file()
-        ],
-        key=lambda p: p.name.lower()
-    )
-
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run standalone Douglas-Peucker CVM measurements."
+        description=(
+            "CVM Douglas-Peucker automation for a flat final_dataset."
+        )
     )
 
     parser.add_argument(
         "--directory",
         required=True,
-        help="Parent directory containing batch001, batch002, etc."
+        help=(
+            "final_dataset directory containing original BMPs and "
+            "the masks folder"
+        )
     )
 
     parser.add_argument(
         "--epsilon",
         type=float,
         default=DEFAULT_EPSILON,
-        help=f"Initial Douglas-Peucker epsilon as a fraction of perimeter "
-             f"(default {DEFAULT_EPSILON})."
+        help=(
+            "Preferred Douglas-Peucker epsilon as a fraction of "
+            "convex-hull perimeter. Default: 0.02"
+        )
     )
 
     args = parser.parse_args()
 
-    root = Path(args.directory).expanduser()
+    dataset = Path(
+        args.directory
+    ).expanduser()
 
-    if not root.exists():
-        raise SystemExit(f"Directory does not exist: {root}")
-
-    if not root.is_dir():
-        raise SystemExit(f"Not a directory: {root}")
-
-    batches = find_batches(root)
-
-    if not batches:
+    if not dataset.is_dir():
         raise SystemExit(
-            f"No batch001/batch002/... folders found beneath:\n{root}"
+            f"ERROR: directory does not exist:\n{dataset}"
         )
 
-    print("=" * 72)
-    print("CVM Douglas-Peucker automation")
-    print("=" * 72)
-    print(f"Target:  {root}")
-    print(f"Batches: {len(batches)}")
-    print(f"Epsilon: {args.epsilon}")
+    mask_root = (
+        dataset /
+        "masks"
+    )
+
+    if not mask_root.is_dir():
+        raise SystemExit(
+            f"ERROR: masks folder does not exist:\n{mask_root}"
+        )
+
+    output_dir = (
+        dataset /
+        "overlaid_Douglas-Peucker"
+    )
+
+    # CSV belongs in the parent directory.
+    csv_path = (
+        dataset.parent /
+        "cvm_measurements.csv"
+    )
+
+    # Only original BMPs directly inside final_dataset.
+    # The masks and overlay directories are therefore never interpreted as
+    # radiograph input.
+    image_files = sorted(
+        [
+            p for p in dataset.glob("*.bmp")
+            if p.is_file()
+        ],
+        key=lambda p: p.name.lower()
+    )
+
+    if not image_files:
+        raise SystemExit(
+            "ERROR: no BMP files found directly inside:\n"
+            f"{dataset}"
+        )
+
+    print("=" * 78)
+    print("CVM DOUGLAS-PEUCKER AUTOMATION")
+    print("=" * 78)
+    print(f"Dataset       : {dataset}")
+    print(f"Original BMPs : {len(image_files)}")
+    print(f"Masks         : {mask_root}")
+    print(f"Overlays      : {output_dir}")
+    print(f"CSV           : {csv_path}")
+    print(f"DP epsilon    : {args.epsilon}")
+    print(f"Doming rule   : ratio > {DOMING_THRESHOLD:.2f}")
+    print()
+    print(
+        "Dome geometry : deepest perpendicular concavity over the "
+        "ENTIRE inferior DP edge"
+    )
+    print()
+    print(
+        "CVM mapping   : 000=CVM1, 100=CVM2, 110=CVM3, "
+        "111=CVM4-6; all other patterns=atypical"
+    )
+    print()
+
+    print("Indexing masks...")
+    mask_index = build_mask_index(
+        mask_root
+    )
+
+    print(
+        f"Indexed {sum(len(x) for x in mask_index.values())} "
+        f"vertebral masks."
+    )
     print()
 
     rows = []
-    total_images = 0
 
-    for batch in batches:
-        images = find_original_images(batch)
+    for i, image_path in enumerate(
+        image_files,
+        start=1
+    ):
+        print(
+            f"[{i}/{len(image_files)}] "
+            f"{image_path.name}",
+            end=" ... ",
+            flush=True
+        )
 
-        print(f"{batch.name}: {len(images)} original BMPs")
+        row = process_image(
+            image_path,
+            mask_index,
+            output_dir,
+            args.epsilon
+        )
 
-        for i, image_path in enumerate(images, 1):
+        rows.append(row)
+
+        print(
+            row["status"]
+        )
+
+        if row["message"]:
             print(
-                f"  [{i}/{len(images)}] {image_path.name}",
-                end=" ... ",
-                flush=True
+                f"    {row['message']}"
             )
 
-            row = process_image(
-                image_path,
-                batch,
-                args.epsilon
+        if row["predicted_CVM"]:
+            print(
+                f"    predicted CVM: "
+                f"{row['predicted_CVM']} "
+                f"(doming pattern {row['doming_pattern']})"
             )
-
-            rows.append(row)
-            total_images += 1
-
-            print(row["status"])
-
-    # Parent-level CSV: the only CSV produced by the production pipeline.
-    csv_path = root / "cvm_measurements.csv"
 
     rows.sort(
-        key=lambda r: (
-            r["batch"].lower(),
-            r["filename"].lower()
-        )
+        key=lambda r: r["filename"].lower()
     )
 
     with open(
@@ -1041,6 +1425,7 @@ def main():
             fieldnames=CSV_COLUMNS,
             extrasaction="ignore"
         )
+
         writer.writeheader()
 
         for row in rows:
@@ -1049,23 +1434,32 @@ def main():
                 for col in CSV_COLUMNS
             })
 
-    ok = sum(r["status"] == "ok" for r in rows)
-    partial = sum(r["status"] == "partial" for r in rows)
-    errors = sum(r["status"] == "error" for r in rows)
+    n_ok = sum(
+        r["status"] == "ok"
+        for r in rows
+    )
+
+    n_partial = sum(
+        r["status"] == "partial"
+        for r in rows
+    )
+
+    n_error = sum(
+        r["status"] == "error"
+        for r in rows
+    )
 
     print()
-    print("=" * 72)
+    print("=" * 78)
     print("DONE")
-    print("=" * 72)
-    print(f"Images processed : {total_images}")
-    print(f"Complete         : {ok}")
-    print(f"Partial          : {partial}")
-    print(f"Errors           : {errors}")
-    print(f"CSV              : {csv_path}")
-    print()
-    print("Overlays are in each batch's:")
-    print("    overlaid_Douglas-Peucker/")
-    print()
+    print("=" * 78)
+    print(f"Total images : {len(rows)}")
+    print(f"Complete     : {n_ok}")
+    print(f"Partial      : {n_partial}")
+    print(f"Errors       : {n_error}")
+    print(f"CSV          : {csv_path}")
+    print(f"Overlays     : {output_dir}")
+    print("=" * 78)
 
 
 if __name__ == "__main__":
