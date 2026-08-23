@@ -506,13 +506,13 @@ def draw_overlay(
 
     offset_arr = np.array(offset, dtype=float)
     mask_grey = (230, 230, 230)
-    quad_green = (80, 145, 85)
+    quad_green = (85, 165, 90)
     posterior_magenta = (255, 0, 255)
     inferior_yellow = (0, 255, 255)
     dome_cyan = (255, 255, 0)
-    line_thickness = max(1, int(round(0.40 * scale)))
-    mask_thickness = max(1, int(round(0.35 * scale)))
-    marker_radius = max(1, int(round(0.85 * scale)))
+    line_thickness = max(1, int(round(0.62 * scale)))
+    mask_thickness = max(1, int(round(0.58 * scale)))
+    marker_radius = max(1, int(round(1.10 * scale)))
     dash = max(4, int(round(5 * scale)))
     gap = max(3, int(round(4 * scale)))
 
