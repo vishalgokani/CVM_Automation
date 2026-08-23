@@ -30,11 +30,26 @@ Optional quick review on the first few images:
 python post-processing\postprocess_cvm.py --target-folder "<TARGET_FOLDER>" --limit 10
 ```
 
+If a dome line still lands on an anterior or posterior sidewall, increase the
+small endpoint exclusion along the inferior chord:
+
+```bat
+python post-processing\postprocess_cvm.py --target-folder "<TARGET_FOLDER>" --inferior-endpoint-trim 0.08
+```
+
 Outputs are written by default to:
 
 ```text
 <TARGET_FOLDER>/postprocessing_overlays/
+<TARGET_FOLDER>/postprocessing_zoom_overlays/
 <TARGET_FOLDER>/cvm_postprocessing_measurements.csv
+```
+
+The `postprocessing_zoom_overlays` folder contains high-resolution PNG crops
+around C2-C4 for review and figure preparation. You can adjust the zoom crop:
+
+```bat
+python post-processing\postprocess_cvm.py --target-folder "<TARGET_FOLDER>" --zoom-scale 4 --zoom-margin 50
 ```
 
 The doming ratios are:

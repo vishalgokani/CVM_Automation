@@ -12,6 +12,7 @@ scratch/
 outputs/
 checkpoints/
 postprocessing_overlays/
+postprocessing_zoom_overlays/
 cvm_postprocessing_measurements.csv
 
 *.pt

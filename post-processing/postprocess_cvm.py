@@ -23,6 +23,9 @@ import numpy as np
 VERTEBRAE = ("C2", "C3", "C4")
 DEFAULT_EPSILON = 0.02
 DEFAULT_MIN_MASK_AREA = 20
+DEFAULT_INFERIOR_ENDPOINT_TRIM = 0.04
+DEFAULT_ZOOM_SCALE = 3.0
+DEFAULT_ZOOM_MARGIN = 35
 DOMING_THRESHOLD = 0.10
 
 
@@ -132,17 +135,35 @@ def order_quad(points: Any) -> np.ndarray:
 
 
 def classify_edges(quad: Any) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """
+    Assign anatomical edges from image-space position.
+
+    The inferior border is the edge between the two bottom-most quadrilateral
+    corners. This is intentionally stricter than choosing the edge with the
+    lowest midpoint, because a long anterior/posterior sidewall can have a low
+    midpoint in tilted vertebrae and should not become the inferior chord.
+    """
     q = order_quad(quad)
-    edges = [
-        (q[0], q[1]),
-        (q[1], q[2]),
-        (q[2], q[3]),
-        (q[3], q[0]),
-    ]
+    edges = [(q[i], q[(i + 1) % 4]) for i in range(4)]
+
+    bottom_vertices = set(np.argsort(q[:, 1])[-2:].tolist())
+    top_vertices = set(np.argsort(q[:, 1])[:2].tolist())
+
+    inferior_i = None
+    superior_i = None
+    for i in range(4):
+        pair = {i, (i + 1) % 4}
+        if pair == bottom_vertices:
+            inferior_i = i
+        if pair == top_vertices:
+            superior_i = i
 
     centers = np.array([(a + b) / 2.0 for a, b in edges])
-    superior_i = int(np.argmin(centers[:, 1]))
-    inferior_i = int(np.argmax(centers[:, 1]))
+    if inferior_i is None:
+        inferior_i = int(np.argmax(np.minimum(q[:, 1], np.roll(q[:, 1], -1))))
+    if superior_i is None:
+        superior_i = int(np.argmin(np.maximum(q[:, 1], np.roll(q[:, 1], -1))))
+
     remaining = [i for i in range(4) if i not in (superior_i, inferior_i)]
     posterior_i = min(remaining, key=lambda i: centers[i, 0])
     anterior_i = max(remaining, key=lambda i: centers[i, 0])
@@ -281,10 +302,54 @@ def find_dp_quad(
     return order_quad(best), contour
 
 
+def cyclic_arc(points: np.ndarray, start: int, end: int) -> np.ndarray:
+    if start <= end:
+        return points[start : end + 1]
+    return np.vstack([points[start:], points[: end + 1]])
+
+
+def inferior_contour_arc(
+    contour_points: np.ndarray,
+    inferior_edge: tuple[np.ndarray, np.ndarray],
+) -> np.ndarray:
+    """
+    Return the actual mask-contour arc between the two inferior quadrilateral
+    corners.
+
+    The full contour also contains anterior and posterior sidewalls. Searching
+    the full contour lets those sidewall points masquerade as a dome apex. The
+    inferior endplate is instead the contour path between the two inferior
+    chord endpoints that stays closest to the chord.
+    """
+    points = as_points(contour_points, name="contour")
+    a = np.asarray(inferior_edge[0], dtype=float)
+    b = np.asarray(inferior_edge[1], dtype=float)
+    v = b - a
+    length = float(np.linalg.norm(v))
+    if length <= 0:
+        raise ValueError("Invalid inferior edge length")
+
+    start = int(np.argmin(np.linalg.norm(points - a, axis=1)))
+    end = int(np.argmin(np.linalg.norm(points - b, axis=1)))
+    arc1 = cyclic_arc(points, start, end)
+    arc2 = cyclic_arc(points, end, start)
+
+    def arc_score(arc: np.ndarray) -> float:
+        distances = np.array([abs(cross2(v, p - a)) / length for p in arc], dtype=float)
+        t = np.dot(arc - a, v) / (length * length)
+        on_chord = (t >= -0.10) & (t <= 1.10)
+        if np.any(on_chord):
+            distances = distances[on_chord]
+        return float(np.percentile(distances, 75) + 0.002 * len(arc))
+
+    return arc1 if arc_score(arc1) <= arc_score(arc2) else arc2
+
+
 def measure_dome(
     contour: np.ndarray,
     inferior_edge: tuple[np.ndarray, np.ndarray],
     quad: np.ndarray,
+    endpoint_trim: float,
 ) -> tuple[float, np.ndarray | None, np.ndarray | None]:
     a = np.asarray(inferior_edge[0], dtype=float)
     b = np.asarray(inferior_edge[1], dtype=float)
@@ -298,7 +363,7 @@ def measure_dome(
     if abs(centroid_cross) < 1e-8:
         return 0.0, None, None
 
-    points = as_points(contour[:, 0, :], name="contour")
+    points = inferior_contour_arc(contour[:, 0, :], inferior_edge)
     cross_values = np.array([cross2(v, p - a) for p in points], dtype=float)
     distances = np.abs(cross_values) / length
     t = np.dot(points - a, v) / (length * length)
@@ -310,8 +375,8 @@ def measure_dome(
     )
     valid = (
         (np.sign(cross_values) == np.sign(centroid_cross))
-        & (t >= 0.0)
-        & (t <= 1.0)
+        & (t >= endpoint_trim)
+        & (t <= 1.0 - endpoint_trim)
         & (distances <= 0.45 * body_height)
     )
     if not np.any(valid):
@@ -329,11 +394,17 @@ def measure_mask(
     vertebra: str,
     epsilon: float,
     min_area: int,
+    endpoint_trim: float,
 ) -> dict[str, Any]:
     mask = read_binary_mask(mask_path, min_area)
     quad, contour = find_dp_quad(mask, epsilon, min_area)
     edges = classify_edges(quad)
-    dome_height, dome_base, dome_apex = measure_dome(contour, edges["inferior"], quad)
+    dome_height, dome_base, dome_apex = measure_dome(
+        contour,
+        edges["inferior"],
+        quad,
+        endpoint_trim,
+    )
 
     return {
         "vertebra": vertebra,
@@ -360,19 +431,30 @@ def ensure_bgr(image: np.ndarray) -> np.ndarray:
     return image.copy()
 
 
+def transform_points(points: Any, *, scale: float, offset: np.ndarray) -> np.ndarray:
+    pts = as_points(points, name="points")
+    return (pts - offset) * scale
+
+
 def draw_dashed_polyline(
     image: np.ndarray,
     points: Any,
     color: tuple[int, int, int],
     *,
+    scale: float = 1.0,
+    offset: np.ndarray | None = None,
     thickness: int = 1,
-    dash: int = 7,
-    gap: int = 5,
+    dash: int = 6,
+    gap: int = 4,
 ) -> None:
-    pts = np.round(as_points(points, name="polyline")).astype(int)
+    if offset is None:
+        offset = np.array([0.0, 0.0], dtype=float)
+    pts = np.round(transform_points(points, scale=scale, offset=offset)).astype(int)
     if len(pts) < 2:
         return
 
+    period = dash + gap
+    phase = 0.0
     for i in range(len(pts)):
         p0 = pts[i].astype(float)
         p1 = pts[(i + 1) % len(pts)].astype(float)
@@ -383,28 +465,56 @@ def draw_dashed_polyline(
         direction = segment / length
         position = 0.0
         while position < length:
-            start = p0 + direction * position
-            end = p0 + direction * min(position + dash, length)
-            cv2.line(
-                image,
-                tuple(np.round(start).astype(int)),
-                tuple(np.round(end).astype(int)),
-                color,
-                thickness,
-                cv2.LINE_AA,
-            )
-            position += dash + gap
+            in_dash = phase < dash
+            step = min(length - position, (dash if in_dash else period) - phase)
+            if in_dash and step > 0:
+                start = p0 + direction * position
+                end = p0 + direction * (position + step)
+                cv2.line(
+                    image,
+                    tuple(np.round(start).astype(int)),
+                    tuple(np.round(end).astype(int)),
+                    color,
+                    thickness,
+                    cv2.LINE_AA,
+                )
+            position += step
+            phase = (phase + step) % period
 
 
-def draw_overlay(original: np.ndarray, results: dict[str, dict[str, Any]]) -> np.ndarray:
+def transformed_point(point: Any, *, scale: float, offset: np.ndarray) -> tuple[int, int]:
+    p = (np.asarray(point, dtype=float) - offset) * scale
+    return tuple(np.round(p).astype(int))
+
+
+def draw_overlay(
+    original: np.ndarray,
+    results: dict[str, dict[str, Any]],
+    *,
+    scale: float = 1.0,
+    offset: tuple[int, int] = (0, 0),
+) -> np.ndarray:
     overlay = ensure_bgr(original)
+    if scale != 1.0:
+        overlay = cv2.resize(
+            overlay,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC,
+        )
 
-    mask_grey = (150, 150, 150)
-    quad_green = (0, 255, 0)
+    offset_arr = np.array(offset, dtype=float)
+    mask_grey = (230, 230, 230)
+    quad_green = (80, 145, 85)
     posterior_magenta = (255, 0, 255)
     inferior_yellow = (0, 255, 255)
     dome_cyan = (255, 255, 0)
-    label_white = (255, 255, 255)
+    line_thickness = max(1, int(round(0.40 * scale)))
+    mask_thickness = max(1, int(round(0.35 * scale)))
+    marker_radius = max(1, int(round(0.85 * scale)))
+    dash = max(4, int(round(5 * scale)))
+    gap = max(3, int(round(4 * scale)))
 
     for vertebra in VERTEBRAE:
         result = results.get(vertebra)
@@ -418,37 +528,73 @@ def draw_overlay(original: np.ndarray, results: dict[str, dict[str, Any]]) -> np
         )
         for contour in contours:
             if cv2.contourArea(contour) >= DEFAULT_MIN_MASK_AREA:
-                draw_dashed_polyline(overlay, contour[:, 0, :], mask_grey)
+                draw_dashed_polyline(
+                    overlay,
+                    contour[:, 0, :],
+                    mask_grey,
+                    scale=scale,
+                    offset=offset_arr,
+                    thickness=mask_thickness,
+                    dash=dash,
+                    gap=gap,
+                )
 
-        quad = np.round(result["quad"]).astype(int)
-        cv2.polylines(overlay, [quad.reshape(-1, 1, 2)], True, quad_green, 2, cv2.LINE_AA)
-
-        p0, p1 = [np.round(p).astype(int) for p in result["edges"]["posterior"]]
-        cv2.line(overlay, tuple(p0), tuple(p1), posterior_magenta, 2, cv2.LINE_AA)
-
-        i0, i1 = [np.round(p).astype(int) for p in result["edges"]["inferior"]]
-        cv2.line(overlay, tuple(i0), tuple(i1), inferior_yellow, 2, cv2.LINE_AA)
-
-        if result["dome_base"] is not None and result["dome_apex"] is not None:
-            base = np.round(result["dome_base"]).astype(int)
-            apex = np.round(result["dome_apex"]).astype(int)
-            cv2.line(overlay, tuple(base), tuple(apex), dome_cyan, 2, cv2.LINE_AA)
-            cv2.circle(overlay, tuple(base), 3, inferior_yellow, -1)
-            cv2.circle(overlay, tuple(apex), 4, dome_cyan, -1)
-
-        center = np.round(result["quad"].mean(axis=0)).astype(int)
-        cv2.putText(
+        quad = np.round(
+            transform_points(result["quad"], scale=scale, offset=offset_arr)
+        ).astype(int)
+        cv2.polylines(
             overlay,
-            vertebra,
-            tuple(center),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            label_white,
-            2,
+            [quad.reshape(-1, 1, 2)],
+            True,
+            quad_green,
+            line_thickness,
             cv2.LINE_AA,
         )
 
+        p0, p1 = [
+            transformed_point(p, scale=scale, offset=offset_arr)
+            for p in result["edges"]["posterior"]
+        ]
+        cv2.line(overlay, p0, p1, posterior_magenta, line_thickness, cv2.LINE_AA)
+
+        i0, i1 = [
+            transformed_point(p, scale=scale, offset=offset_arr)
+            for p in result["edges"]["inferior"]
+        ]
+        cv2.line(overlay, i0, i1, inferior_yellow, line_thickness, cv2.LINE_AA)
+
+        if result["dome_base"] is not None and result["dome_apex"] is not None:
+            base = transformed_point(result["dome_base"], scale=scale, offset=offset_arr)
+            apex = transformed_point(result["dome_apex"], scale=scale, offset=offset_arr)
+            cv2.line(overlay, base, apex, dome_cyan, line_thickness, cv2.LINE_AA)
+            cv2.circle(overlay, base, marker_radius, inferior_yellow, -1, cv2.LINE_AA)
+            cv2.circle(overlay, apex, marker_radius, dome_cyan, -1, cv2.LINE_AA)
+
     return overlay
+
+
+def crop_bounds_for_results(
+    image_shape: tuple[int, ...],
+    results: dict[str, dict[str, Any]],
+    margin: int,
+) -> tuple[int, int, int, int] | None:
+    points = [
+        result["quad"]
+        for vertebra in VERTEBRAE
+        if (result := results.get(vertebra)) is not None
+    ]
+    if not points:
+        return None
+
+    all_points = np.vstack(points)
+    height, width = image_shape[:2]
+    x0 = max(0, int(np.floor(all_points[:, 0].min())) - margin)
+    y0 = max(0, int(np.floor(all_points[:, 1].min())) - margin)
+    x1 = min(width, int(np.ceil(all_points[:, 0].max())) + margin)
+    y1 = min(height, int(np.ceil(all_points[:, 1].max())) + margin)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
 
 
 def add_measurements_to_row(
@@ -524,8 +670,12 @@ def process_image(
     mask_index: dict[tuple[str, str], list[Path]],
     target_folder: Path,
     output_folder: Path,
+    zoom_output_folder: Path,
     epsilon: float,
     min_area: int,
+    endpoint_trim: float,
+    zoom_scale: float,
+    zoom_margin: int,
 ) -> dict[str, str]:
     row = {column: "" for column in CSV_COLUMNS}
     row["filename"] = image_path.name
@@ -546,7 +696,13 @@ def process_image(
             errors.append(f"{vertebra}: mask not found")
             continue
         try:
-            results[vertebra] = measure_mask(mask_path, vertebra, epsilon, min_area)
+            results[vertebra] = measure_mask(
+                mask_path,
+                vertebra,
+                epsilon,
+                min_area,
+                endpoint_trim,
+            )
         except Exception as exc:
             errors.append(f"{vertebra}: {exc}")
 
@@ -555,6 +711,21 @@ def process_image(
     overlay_path = output_folder / image_path.name
     if not cv2.imwrite(str(overlay_path), overlay):
         errors.append("Could not write overlay")
+
+    crop_bounds = crop_bounds_for_results(original.shape, results, zoom_margin)
+    if crop_bounds is not None:
+        x0, y0, x1, y1 = crop_bounds
+        crop = original[y0:y1, x0:x1]
+        zoom_overlay = draw_overlay(
+            crop,
+            results,
+            scale=zoom_scale,
+            offset=(x0, y0),
+        )
+        zoom_output_folder.mkdir(parents=True, exist_ok=True)
+        zoom_path = zoom_output_folder / f"{image_path.stem}_c2_c4_zoom.png"
+        if not cv2.imwrite(str(zoom_path), zoom_overlay):
+            errors.append("Could not write zoom overlay")
 
     add_measurements_to_row(row, results, target_folder)
     classify_cvm(row, results)
@@ -587,6 +758,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional overlay output folder. Defaults to <target-folder>/postprocessing_overlays.",
     )
     parser.add_argument(
+        "--zoom-output-folder",
+        type=Path,
+        default=None,
+        help=(
+            "Optional high-resolution C2-C4 zoom overlay folder. Defaults to "
+            "<target-folder>/postprocessing_zoom_overlays."
+        ),
+    )
+    parser.add_argument(
         "--csv",
         type=Path,
         default=None,
@@ -605,10 +785,31 @@ def parse_args() -> argparse.Namespace:
         help="Minimum foreground pixels required in a vertebral mask.",
     )
     parser.add_argument(
+        "--inferior-endpoint-trim",
+        type=float,
+        default=DEFAULT_INFERIOR_ENDPOINT_TRIM,
+        help=(
+            "Fraction of each inferior chord end excluded from dome-apex search "
+            "to avoid anterior/posterior sidewall points. Default: 0.04."
+        ),
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
         help="Optional maximum number of images to process for quick review.",
+    )
+    parser.add_argument(
+        "--zoom-scale",
+        type=float,
+        default=DEFAULT_ZOOM_SCALE,
+        help="Upsampling scale for C2-C4 zoom overlays. Default: 3.0.",
+    )
+    parser.add_argument(
+        "--zoom-margin",
+        type=int,
+        default=DEFAULT_ZOOM_MARGIN,
+        help="Pixel margin around C2-C4 for zoom overlays before upsampling.",
     )
     return parser.parse_args()
 
@@ -626,6 +827,11 @@ def main() -> None:
         if args.output_folder is not None
         else target_folder / "postprocessing_overlays"
     )
+    zoom_output_folder = (
+        args.zoom_output_folder.expanduser().resolve()
+        if args.zoom_output_folder is not None
+        else target_folder / "postprocessing_zoom_overlays"
+    )
     csv_path = (
         args.csv.expanduser().resolve()
         if args.csv is not None
@@ -636,6 +842,12 @@ def main() -> None:
         raise SystemExit(f"ERROR: target folder does not exist: {target_folder}")
     if not masks_folder.is_dir():
         raise SystemExit(f"ERROR: masks folder does not exist: {masks_folder}")
+    if not 0.0 <= args.inferior_endpoint_trim < 0.5:
+        raise SystemExit("ERROR: --inferior-endpoint-trim must be >= 0 and < 0.5")
+    if args.zoom_scale < 1.0:
+        raise SystemExit("ERROR: --zoom-scale must be >= 1.0")
+    if args.zoom_margin < 0:
+        raise SystemExit("ERROR: --zoom-margin must be >= 0")
 
     image_files = sorted(
         [p for p in target_folder.glob("*.bmp") if p.is_file()],
@@ -658,8 +870,12 @@ def main() -> None:
             mask_index,
             target_folder,
             output_folder,
+            zoom_output_folder,
             args.epsilon,
             args.min_mask_area,
+            args.inferior_endpoint_trim,
+            args.zoom_scale,
+            args.zoom_margin,
         )
         rows.append(row)
         print(row["status"])
@@ -678,6 +894,7 @@ def main() -> None:
 
     print()
     print(f"Overlays: {output_folder}")
+    print(f"Zooms   : {zoom_output_folder}")
     print(f"CSV     : {csv_path}")
 
 
