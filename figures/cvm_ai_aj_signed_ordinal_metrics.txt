@@ -1,0 +1,14 @@
+Paired ordinal AI vs AJ metrics
+===============================
+
+Included rows: AJ in CVM1/CVM2/CVM3/CVM4-6 and AI in CVM1/CVM2/CVM3/CVM4-6.
+Excluded rows: blank AJ, non-ordered AJ values, and AI atypical predictions.
+Ordinal order: CVM1, CVM2, CVM3, CVM4-6.
+
+n: 163
+Quadratic weighted kappa: 0.764
+Mean absolute ordinal error: 0.423
+Median absolute ordinal error: 0.000
+Within-one-stage accuracy: 0.890
+Exact accuracy: 0.730
+Balanced accuracy: 0.535

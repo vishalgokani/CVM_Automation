@@ -1,0 +1,38 @@
+AI vs AJ comparison
+===================
+
+AI column: predicted_CVM
+AJ column: Ground_Truth
+Total rows: 1332
+Rows with valid CVM ground truth: 242
+Exact matches on valid ground truth: 119
+Accuracy on valid ground truth: 0.492
+
+Ground-truth counts:
+  <blank>: 992
+  CV2: 1
+  CVM1: 64
+  CVM2: 21
+  CVM3: 36
+  CVM4-6: 121
+  N: 96
+  Y: 1
+
+Prediction counts:
+  CVM1: 161
+  CVM2: 41
+  CVM3: 68
+  CVM4-6: 365
+  atypical: 697
+
+Invalid or blank AJ values excluded from performance panels:
+  <blank>: 992
+  CV2: 1
+  N: 96
+  Y: 1
+
+Per-stage recall:
+  CVM1: 36/64 = 0.562
+  CVM2: 1/21 = 0.048
+  CVM3: 7/36 = 0.194
+  CVM4-6: 75/121 = 0.620

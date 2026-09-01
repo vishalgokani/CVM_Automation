@@ -1,0 +1,96 @@
+{
+  "total_rows": 1332,
+  "valid_ground_truth_rows": 242,
+  "exact_matches_on_valid_ground_truth": 119,
+  "accuracy_on_valid_ground_truth": 0.49173553719008267,
+  "ground_truth_counts": {
+    "": 992,
+    "CV2": 1,
+    "CVM1": 64,
+    "CVM2": 21,
+    "CVM3": 36,
+    "CVM4-6": 121,
+    "N": 96,
+    "Y": 1
+  },
+  "prediction_counts": {
+    "CVM1": 161,
+    "CVM2": 41,
+    "CVM3": 68,
+    "CVM4-6": 365,
+    "atypical": 697
+  },
+  "invalid_or_blank_ground_truth_counts": {
+    "": 992,
+    "CV2": 1,
+    "N": 96,
+    "Y": 1
+  },
+  "per_stage_recall": {
+    "CVM1": {
+      "correct": 36,
+      "total": 64,
+      "recall": 0.5625
+    },
+    "CVM2": {
+      "correct": 1,
+      "total": 21,
+      "recall": 0.047619047619047616
+    },
+    "CVM3": {
+      "correct": 7,
+      "total": 36,
+      "recall": 0.19444444444444445
+    },
+    "CVM4-6": {
+      "correct": 75,
+      "total": 121,
+      "recall": 0.6198347107438017
+    }
+  },
+  "confusion_matrix": {
+    "rows": [
+      "CVM1",
+      "CVM2",
+      "CVM3",
+      "CVM4-6"
+    ],
+    "columns": [
+      "CVM1",
+      "CVM2",
+      "CVM3",
+      "CVM4-6",
+      "atypical"
+    ],
+    "counts": [
+      [
+        36,
+        2,
+        2,
+        2,
+        22
+      ],
+      [
+        6,
+        1,
+        3,
+        4,
+        7
+      ],
+      [
+        4,
+        2,
+        7,
+        7,
+        16
+      ],
+      [
+        5,
+        1,
+        6,
+        75,
+        34
+      ]
+    ]
+  }
+}
